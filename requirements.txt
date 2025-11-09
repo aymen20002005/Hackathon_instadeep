@@ -1,0 +1,9 @@
+streamlit
+tensorflow
+tensorflow-hub
+librosa
+mediapipe
+opencv-python
+numpy
+pandas
+soundfile
