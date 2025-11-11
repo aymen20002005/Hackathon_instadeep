@@ -157,6 +157,7 @@ def main():
     # -------------------------------
     # Step 0: Pre-chatbot question
     # -------------------------------
+    yamnet_model, class_names = load_yamnet()
     if "user_feeling" not in st.session_state:
         st.session_state.user_feeling = None
 
@@ -179,8 +180,7 @@ def main():
 
     # Only show the main app if user said NO
     if st.session_state.user_feeling == "no":
-        st.markdown("<h1 style='text-align:center;'>🎤 Cough & Breathing + 🧍 Tripod Detector</h1>", unsafe_allow_html=True)
-        yamnet_model, class_names = load_yamnet()
+        st.markdown("<h1 style='text-align:center;'> Cough & Breathing Classifier + Tripod Detector</h1>", unsafe_allow_html=True)
 
         tab_audio, tab_video = st.tabs(["🫁 Audio Analysis", "🎥 Posture Detection"])
 
