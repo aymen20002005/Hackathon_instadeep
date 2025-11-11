@@ -11,7 +11,6 @@ from math import atan2, degrees
 from datetime import datetime
 from audio_recorder_streamlit import audio_recorder
 import scipy.signal as signal
-import matplotlib.pyplot as plt
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 import av
 
@@ -155,105 +154,130 @@ class VideoRecorder(VideoTransformerBase):
 # Main App
 # -----------------------------------------------------
 def main():
-    st.markdown("<h1 style='text-align:center;'>🎤 Cough & Breathing + 🧍 Tripod Detector</h1>", unsafe_allow_html=True)
-    yamnet_model, class_names = load_yamnet()
+    # -------------------------------
+    # Step 0: Pre-chatbot question
+    # -------------------------------
+    if "user_feeling" not in st.session_state:
+        st.session_state.user_feeling = None
 
-    tab_audio, tab_video = st.tabs(["🫁 Audio Analysis", "🎥 Posture Detection"])
+    if st.session_state.user_feeling is None:
+        st.markdown("<h1 style='text-align:center;'>🤖 Quick Health Check</h1>", unsafe_allow_html=True)
+        st.markdown("<h3 style='text-align:center;'>Do you feel well today?</h3>", unsafe_allow_html=True)
 
-    # --- AUDIO TAB ---
-    with tab_audio:
-        with st.container():
-            st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-            st.subheader("Step 1 · Audio Analysis")
-            st.caption("Upload or record breathing/cough audio to detect cough probability and respiration rate.")
-            choice = st.radio("Select input method:", ["📁 Upload Audio File", "🎙️ Record Audio"])
-            save_path = None
+        col_yes, col_no = st.columns([1, 1])
+        with col_yes:
+            if st.button("Yes"):
+                st.session_state.user_feeling = "yes"
+        with col_no:
+            if st.button("No"):
+                st.session_state.user_feeling = "no"
 
-            col1, col2 = st.columns(2)
+    # Stop if user said yes
+    if st.session_state.user_feeling == "yes":
+        st.success("Great! Stay healthy. 🎉")
+        st.stop()
 
-            # 📁 Upload File First
-            with col1:
-                if choice == "📁 Upload Audio File":
-                    st.info("Upload your audio clip (wav/mp3/m4a/etc.)")
-                    file = st.file_uploader("Choose audio file", type=["wav","mp3","m4a","flac","ogg"])
+    # Only show the main app if user said NO
+    if st.session_state.user_feeling == "no":
+        st.markdown("<h1 style='text-align:center;'>🎤 Cough & Breathing + 🧍 Tripod Detector</h1>", unsafe_allow_html=True)
+        yamnet_model, class_names = load_yamnet()
+
+        tab_audio, tab_video = st.tabs(["🫁 Audio Analysis", "🎥 Posture Detection"])
+
+        # --- AUDIO TAB ---
+        with tab_audio:
+            with st.container():
+                st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+                st.subheader("Step 1 · Audio Analysis")
+                st.caption("Upload or record breathing/cough audio to detect cough probability and respiration rate.")
+                choice = st.radio("Select input method:", ["📁 Upload Audio File", "🎙️ Record Audio"])
+                save_path = None
+
+                col1, col2 = st.columns(2)
+
+                # 📁 Upload File
+                with col1:
+                    if choice == "📁 Upload Audio File":
+                        st.info("Upload your audio clip (wav/mp3/m4a/etc.)")
+                        file = st.file_uploader("Choose audio file", type=["wav","mp3","m4a","flac","ogg"])
+                        if file:
+                            name = f"saved_audio/uploaded_{datetime.now():%Y%m%d_%H%M%S}_{file.name}"
+                            open(name, "wb").write(file.read())
+                            save_path = name
+                            st.audio(save_path)
+                            st.success("✅ File uploaded successfully")
+
+                # 🎙️ Record
+                with col2:
+                    if choice == "🎙️ Record Audio":
+                        st.info("Click to start and stop recording.")
+                        audio_bytes = audio_recorder(sample_rate=16000)
+                        if audio_bytes:
+                            name = f"saved_audio/recording_{datetime.now():%Y%m%d_%H%M%S}.wav"
+                            open(name, "wb").write(audio_bytes)
+                            save_path = name
+                            st.audio(save_path)
+                            st.success("✅ Recording saved")
+
+                # Analysis
+                if save_path:
+                    with st.spinner("🔍 Analyzing audio..."):
+                        try:
+                            cough_prob = predict_cough_from_file(save_path, yamnet_model, class_names)
+                            rpm, breaths = calculate_rpm(save_path)
+                            colA, colB = st.columns(2)
+                            with colA: st.metric("💨 Cough Probability", f"{cough_prob:.2f}")
+                            with colB: st.metric("🫁 Respirations / min", f"{rpm:.1f}")
+                            st.caption(f"Detected {breaths} breaths in this clip.")
+                            st.success("💨 Cough detected!" if cough_prob>0.3 else "🫁 No strong cough detected.")
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+        # --- VIDEO TAB ---
+        with tab_video:
+            with st.container():
+                st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+                st.subheader("Step 2 · Tripod Detection")
+                st.caption("Upload or record a short video to detect the 'tripod' sitting posture.")
+                choice = st.radio("Video Input:", ["📁 Upload Video", "🎥 Record Webcam"])
+                video_path = None
+
+                if choice == "📁 Upload Video":
+                    file = st.file_uploader("Upload video", type=["mp4","mov","avi","mkv"])
                     if file:
-                        name = f"saved_audio/uploaded_{datetime.now():%Y%m%d_%H%M%S}_{file.name}"
-                        open(name, "wb").write(file.read())
-                        save_path = name
-                        st.audio(save_path)
-                        st.success("✅ File uploaded successfully")
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.name)[1])
+                        tmp.write(file.read()); tmp.close()
+                        video_path = tmp.name
 
-            # 🎙️ Record Second
-            with col2:
-                if choice == "🎙️ Record Audio":
-                    st.info("Click to start and stop recording.")
-                    audio_bytes = audio_recorder(sample_rate=16000)
-                    if audio_bytes:
-                        name = f"saved_audio/recording_{datetime.now():%Y%m%d_%H%M%S}.wav"
-                        open(name, "wb").write(audio_bytes)
-                        save_path = name
-                        st.audio(save_path)
-                        st.success("✅ Recording saved")
+                elif choice == "🎥 Record Webcam":
+                    st.info("Start webcam, then stop and click 'Save Recording'.")
+                    ctx = webrtc_streamer(key="rec", video_transformer_factory=VideoRecorder)
+                    if ctx.video_transformer and st.button("Save Recording"):
+                        frames = ctx.video_transformer.frames
+                        if frames:
+                            out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+                            h, w, _ = frames[0].shape
+                            writer = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*"mp4v"), 20, (w,h))
+                            for f in frames: writer.write(f)
+                            writer.release()
+                            video_path = out
+                            st.success("🎬 Recording saved")
+                        else:
+                            st.warning("No frames recorded. Try again.")
 
-            # Analysis
-            if save_path:
-                with st.spinner("🔍 Analyzing audio..."):
-                    try:
-                        cough_prob = predict_cough_from_file(save_path, yamnet_model, class_names)
-                        rpm, breaths = calculate_rpm(save_path)
-                        colA, colB = st.columns(2)
-                        with colA: st.metric("💨 Cough Probability", f"{cough_prob:.2f}")
-                        with colB: st.metric("🫁 Respirations / min", f"{rpm:.1f}")
-                        st.caption(f"Detected {breaths} breaths in this clip.")
-                        st.success("💨 Cough detected!" if cough_prob>0.3 else "🫁 No strong cough detected.")
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-            st.markdown("</div>", unsafe_allow_html=True)
+                if video_path:
+                    with st.spinner("🔍 Analyzing posture..."):
+                        try:
+                            out, ratio = process_video_tripod(video_path, tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name)
+                            st.video(out)
+                            st.metric("🧍 Tripod Detected Frames", f"{ratio*100:.1f}%")
+                            st.success("Tripod posture detected!" if ratio>0.2 else "Tripod posture rarely detected.")
+                        except Exception as e:
+                            st.error(f"Error processing video: {e}")
+                st.markdown("</div>", unsafe_allow_html=True)
 
-    # --- VIDEO TAB ---
-    with tab_video:
-        with st.container():
-            st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-            st.subheader("Step 2 · Tripod Detection")
-            st.caption("Upload or record a short video to detect the 'tripod' sitting posture.")
-            choice = st.radio("Video Input:", ["📁 Upload Video", "🎥 Record Webcam"])
-            video_path = None
-
-            if choice == "📁 Upload Video":
-                file = st.file_uploader("Upload video", type=["mp4","mov","avi","mkv"])
-                if file:
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.name)[1])
-                    tmp.write(file.read()); tmp.close()
-                    video_path = tmp.name
-
-            elif choice == "🎥 Record Webcam":
-                st.info("Start webcam, then stop and click 'Save Recording'.")
-                ctx = webrtc_streamer(key="rec", video_transformer_factory=VideoRecorder)
-                if ctx.video_transformer and st.button("Save Recording"):
-                    frames = ctx.video_transformer.frames
-                    if frames:
-                        out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-                        h, w, _ = frames[0].shape
-                        writer = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*"mp4v"), 20, (w,h))
-                        for f in frames: writer.write(f)
-                        writer.release()
-                        video_path = out
-                        st.success("🎬 Recording saved")
-                    else:
-                        st.warning("No frames recorded. Try again.")
-
-            if video_path:
-                with st.spinner("🔍 Analyzing posture..."):
-                    try:
-                        out, ratio = process_video_tripod(video_path, tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name)
-                        st.video(out)
-                        st.metric("🧍 Tripod Detected Frames", f"{ratio*100:.1f}%")
-                        st.success("Tripod posture detected!" if ratio>0.2 else "Tripod posture rarely detected.")
-                    except Exception as e:
-                        st.error(f"Error processing video: {e}")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<p class='footer'>© 2025 Cough + Tripod Detector | Built with Streamlit</p>", unsafe_allow_html=True)
+        st.markdown("<p class='footer'>© 2025 Cough + Tripod Detector | Built with Streamlit</p>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
