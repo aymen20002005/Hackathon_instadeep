@@ -15,18 +15,44 @@ import matplotlib.pyplot as plt
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 import av
 
-# --------------------------------------------
-# Streamlit App Configuration
-# --------------------------------------------
+# -----------------------------------------------------
+# Streamlit App Configuration & Custom Styling
+# -----------------------------------------------------
 st.set_page_config(page_title="Cough + Tripod Detector", layout="wide")
+
+st.markdown("""
+    <style>
+        .stApp {
+            background-color: #f9fafb;
+            font-family: "Inter", sans-serif;
+        }
+        h1, h2, h3, h4 {
+            font-weight: 700;
+            color: #1f2937;
+        }
+        .section-card {
+            background-color: white;
+            padding: 1.5rem 2rem;
+            border-radius: 1rem;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+            margin-bottom: 2rem;
+        }
+        .footer {
+            text-align: center;
+            color: #9ca3af;
+            font-size: 0.9em;
+            margin-top: 3rem;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
 os.makedirs("saved_audio", exist_ok=True)
 
-# --------------------------------------------
+# -----------------------------------------------------
 # Load YAMNet Model
-# --------------------------------------------
+# -----------------------------------------------------
 @st.cache_resource
 def load_yamnet():
-    """Load YAMNet from TF Hub and return model and class names."""
     yamnet_model = hub.load("https://tfhub.dev/google/yamnet/1")
     class_map_path = yamnet_model.class_map_path().numpy().decode('utf-8')
     import pandas as pd
@@ -34,282 +60,200 @@ def load_yamnet():
     class_names = class_map['display_name'].tolist()
     return yamnet_model, class_names
 
-# --------------------------------------------
-# Audio Cough Detection
-# --------------------------------------------
+# -----------------------------------------------------
+# Audio Utilities
+# -----------------------------------------------------
 def predict_cough_from_file(file_path, yamnet_model, class_names, threshold=0.3):
     y, sr = librosa.load(file_path, sr=None, mono=True)
     if y.ndim > 1:
         y = np.mean(y, axis=1)
     if sr != 16000:
         y = librosa.resample(y, orig_sr=sr, target_sr=16000)
-        sr = 16000
     y = y.astype(np.float32)
 
-    scores, embeddings, spectrogram = yamnet_model(y)
-    scores_np = scores.numpy()
-    mean_scores = np.mean(scores_np, axis=0)
+    scores, _, _ = yamnet_model(y)
+    mean_scores = np.mean(scores.numpy(), axis=0)
+    cough_idx = next((i for i, n in enumerate(class_names) if "cough" in n.lower()), None)
+    return float(mean_scores[cough_idx]) if cough_idx is not None else 0.0
 
-    cough_idx = next((i for i, name in enumerate(class_names) if "cough" in name.lower()), None)
-    cough_prob = float(mean_scores[cough_idx]) if cough_idx is not None else 0.0
-
-    return cough_prob
-
-# --------------------------------------------
-# Respiration Rate Estimation
-# --------------------------------------------
-def calculate_rpm(audio_file, plot=False):
+def calculate_rpm(audio_file):
     y, sr = librosa.load(audio_file, sr=None)
     if y.ndim > 1:
         y = np.mean(y, axis=1)
-
     nyquist = 0.5 * sr
-    low = 0.1 / nyquist
-    high = 2.0 / nyquist
-    b, a = signal.butter(2, [low, high], btype='band')
-    y_filtered = signal.filtfilt(b, a, y)
-
-    envelope = np.abs(signal.hilbert(y_filtered))
+    b, a = signal.butter(2, [0.1/nyquist, 2.0/nyquist], btype='band')
+    y_filt = signal.filtfilt(b, a, y)
+    envelope = np.abs(signal.hilbert(y_filt))
     peaks, _ = signal.find_peaks(envelope, distance=sr * 0.5)
+    duration_min = len(y) / sr / 60
+    return len(peaks) / duration_min, len(peaks)
 
-    duration_min = len(y) / sr / 60.0
-    num_breaths = len(peaks)
-    rpm = num_breaths / duration_min
-
-    if plot:
-        t = np.arange(len(y)) / sr
-        plt.figure(figsize=(12, 4))
-        plt.plot(t, y, label='Raw signal')
-        plt.plot(t, y_filtered, label='Filtered (0.1-2 Hz)')
-        plt.plot(t, envelope, label='Envelope', alpha=0.7)
-        plt.plot(peaks / sr, envelope[peaks], 'rx', label='Detected breaths')
-        plt.xlabel("Time (s)")
-        plt.ylabel("Amplitude")
-        plt.title(f"Estimated RPM: {rpm:.2f}")
-        plt.legend()
-        st.pyplot(plt)
-        plt.close()
-
-    return rpm, num_breaths
-
-# --------------------------------------------
-# Pose Estimation Utilities
-# --------------------------------------------
-def angle_2d(a, b):
-    return degrees(atan2(b[1] - a[1], b[0] - a[0]))
-
-def distance(a, b):
-    return np.hypot(a[0] - b[0], a[1] - b[1])
+# -----------------------------------------------------
+# Pose Detection Utilities
+# -----------------------------------------------------
+def angle_2d(a, b): return degrees(atan2(b[1]-a[1], b[0]-a[0]))
+def distance(a, b): return np.hypot(a[0]-b[0], a[1]-b[1])
 
 def evaluate_tripod(landmarks, image_shape):
-    """Compute if person is in tripod position using heuristic rules."""
     h, w, _ = image_shape
-
-    def get_landmark(idx):
+    def get_lm(idx):
         lm = landmarks[idx]
         return np.array([lm.x * w, lm.y * h])
 
-    # Extract key landmarks
-    shoulder = (get_landmark(mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER.value) +
-                get_landmark(mp.solutions.pose.PoseLandmark.LEFT_SHOULDER.value)) / 2
-    hip = (get_landmark(mp.solutions.pose.PoseLandmark.RIGHT_HIP.value) +
-           get_landmark(mp.solutions.pose.PoseLandmark.LEFT_HIP.value)) / 2
-    knee_r = get_landmark(mp.solutions.pose.PoseLandmark.RIGHT_KNEE.value)
-    knee_l = get_landmark(mp.solutions.pose.PoseLandmark.LEFT_KNEE.value)
-    wrist_r = get_landmark(mp.solutions.pose.PoseLandmark.RIGHT_WRIST.value)
-    wrist_l = get_landmark(mp.solutions.pose.PoseLandmark.LEFT_WRIST.value)
+    mp_pose = mp.solutions.pose
+    shoulder = (get_lm(mp_pose.PoseLandmark.RIGHT_SHOULDER.value) + get_lm(mp_pose.PoseLandmark.LEFT_SHOULDER.value)) / 2
+    hip = (get_lm(mp_pose.PoseLandmark.RIGHT_HIP.value) + get_lm(mp_pose.PoseLandmark.LEFT_HIP.value)) / 2
+    knee_r = get_lm(mp_pose.PoseLandmark.RIGHT_KNEE.value)
+    knee_l = get_lm(mp_pose.PoseLandmark.LEFT_KNEE.value)
+    wrist_r = get_lm(mp_pose.PoseLandmark.RIGHT_WRIST.value)
+    wrist_l = get_lm(mp_pose.PoseLandmark.LEFT_WRIST.value)
+    ref = distance(get_lm(mp_pose.PoseLandmark.RIGHT_SHOULDER.value),
+                   get_lm(mp_pose.PoseLandmark.LEFT_SHOULDER.value)) + 1e-6
 
-    # Reference body size (shoulder width)
-    shoulder_r = get_landmark(mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER.value)
-    shoulder_l = get_landmark(mp.solutions.pose.PoseLandmark.LEFT_SHOULDER.value)
-    ref_dist = distance(shoulder_r, shoulder_l) + 1e-6
-
-    # Heuristic 1: torso leaning forward
     torso_angle = angle_2d(hip, shoulder)
-    leaning_forward = torso_angle < 60
-
-    # Heuristic 2: sitting posture (hips not far above knees)
+    leaning = torso_angle < 60
     knee_mid = (knee_r + knee_l) / 2
-    hip_height = hip[1]
-    sitting_like = hip_height < knee_mid[1] * 1.15
+    sitting = hip[1] < knee_mid[1] * 1.15
+    hands_near = (distance(wrist_r, knee_r)/ref < 1 and distance(wrist_l, knee_l)/ref < 1)
 
-    # Heuristic 3: hands near knees/thighs
-    dist_r = distance(wrist_r, knee_r) / ref_dist
-    dist_l = distance(wrist_l, knee_l) / ref_dist
-    hands_near_knees = (dist_r < 1.0 and dist_l < 1.0)
+    score = 0.4*leaning + 0.3*sitting + 0.3*hands_near
+    return {"tripod": score > 0.6, "score": score}
 
-    # Combine score
-    score = 0.4 * leaning_forward + 0.3 * sitting_like + 0.3 * hands_near_knees
-    is_tripod = score > 0.6
-
-    return {
-        "tripod": is_tripod,
-        "score": score,
-        "leaning_forward": leaning_forward,
-        "sitting_like": sitting_like,
-        "hands_near_knees": hands_near_knees,
-    }
-
-# --------------------------------------------
-# Tripod Detection from Video
-# --------------------------------------------
 def process_video_tripod(input_path, output_path):
     mp_pose = mp.solutions.pose
-    mp_drawing = mp.solutions.drawing_utils
-
     pose = mp_pose.Pose(static_image_mode=False, model_complexity=1)
+    draw = mp.solutions.drawing_utils
+
     cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        raise IOError(f"Cannot open video: {input_path}")
-
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    w, h = int(cap.get(3)), int(cap.get(4))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'avc1'), fps, (width, height))
+    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'avc1'), fps, (w, h))
 
-    frame_idx = 0
-    tripod_frames = 0
-
+    total, tripod_frames = 0, 0
     while True:
         ret, frame = cap.read()
-        if not ret:
-            break
-
-        results = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        if results.pose_landmarks:
-            mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-            res = evaluate_tripod(results.pose_landmarks.landmark, frame.shape)
-
-            label = f"Tripod: {'YES' if res['tripod'] else 'NO'}  score={res['score']:.2f}"
-            color = (0, 255, 0) if res['tripod'] else (0, 0, 255)
-            cv2.rectangle(frame, (5, 5), (450, 55), (0, 0, 0), -1)
-            cv2.putText(frame, label, (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
-            if res["tripod"]:
-                tripod_frames += 1
-
+        if not ret: break
+        res = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        if res.pose_landmarks:
+            draw.draw_landmarks(frame, res.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+            eval_res = evaluate_tripod(res.pose_landmarks.landmark, frame.shape)
+            label = f"Tripod: {'YES' if eval_res['tripod'] else 'NO'} | score={eval_res['score']:.2f}"
+            cv2.rectangle(frame, (10,10), (460,50), (0,0,0), -1)
+            cv2.putText(frame, label, (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                        (0,255,0) if eval_res['tripod'] else (0,0,255), 2)
+            if eval_res['tripod']: tripod_frames += 1
         writer.write(frame)
-        frame_idx += 1
+        total += 1
+    cap.release(); writer.release(); pose.close()
+    return output_path, tripod_frames / max(total, 1)
 
-    cap.release()
-    writer.release()
-    pose.close()
-
-    tripod_ratio = tripod_frames / max(1, frame_idx)
-    return output_path, tripod_ratio
-
-# --------------------------------------------
-# Webcam Video Recording Transformer
-# --------------------------------------------
 class VideoRecorder(VideoTransformerBase):
-    def __init__(self):
-        self.frames = []
+    def __init__(self): self.frames = []
+    def transform(self, f: av.VideoFrame): self.frames.append(f.to_ndarray(format="bgr24")); return f
 
-    def transform(self, frame: av.VideoFrame) -> av.VideoFrame:
-        self.frames.append(frame.to_ndarray(format="bgr24"))
-        return frame
-
-# --------------------------------------------
-# Main Streamlit App
-# --------------------------------------------
+# -----------------------------------------------------
+# Main App
+# -----------------------------------------------------
 def main():
-    st.title("🎤 Cough + Breathing → 🧍 Tripod Detection App")
+    st.markdown("<h1 style='text-align:center;'>🎤 Cough & Breathing + 🧍 Tripod Detector</h1>", unsafe_allow_html=True)
     yamnet_model, class_names = load_yamnet()
 
-    # --------------------
-    # 1️⃣ Audio Detection
-    # --------------------
-    st.header("Step 1: Record or Upload Your Audio")
-    cough_detected = False
-    audio_source = st.radio("Choose audio input method:", ["🎙️ Record Audio", "📁 Upload Audio File"])
-    save_path = None
+    tab_audio, tab_video = st.tabs(["🫁 Audio Analysis", "🎥 Posture Detection"])
 
-    if audio_source == "🎙️ Record Audio":
-        st.subheader("🎤 Record your breathing or cough below:")
-        audio_bytes = audio_recorder(sample_rate=16000)
-        if audio_bytes:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            save_path = f"saved_audio/recording_{timestamp}.wav"
-            with open(save_path, "wb") as f:
-                f.write(audio_bytes)
-            st.audio(save_path, format="audio/wav")
-            st.success(f"✅ Recording saved as `{save_path}`")
+    # --- AUDIO TAB ---
+    with tab_audio:
+        with st.container():
+            st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+            st.subheader("Step 1 · Audio Analysis")
+            st.caption("Upload or record breathing/cough audio to detect cough probability and respiration rate.")
+            choice = st.radio("Select input method:", ["📁 Upload Audio File", "🎙️ Record Audio"])
+            save_path = None
 
-    elif audio_source == "📁 Upload Audio File":
-        st.subheader("📁 Upload your audio file (wav/mp3/m4a/etc.)")
-        audio_file = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m4a", "flac", "ogg"])
-        if audio_file:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            save_path = f"saved_audio/uploaded_{timestamp}_{audio_file.name}"
-            with open(save_path, "wb") as f:
-                f.write(audio_file.read())
-            st.audio(save_path, format="audio/wav")
+            col1, col2 = st.columns(2)
 
-    if save_path:
-        with st.spinner("Analyzing audio..."):
-            try:
-                cough_prob = predict_cough_from_file(save_path, yamnet_model, class_names)
-                st.write(f"Predicted cough probability: **{cough_prob:.3f}**")
-                cough_detected = cough_prob > 0.3
-            except Exception as e:
-                st.error(f"Error detecting cough: {e}")
+            # 📁 Upload File First
+            with col1:
+                if choice == "📁 Upload Audio File":
+                    st.info("Upload your audio clip (wav/mp3/m4a/etc.)")
+                    file = st.file_uploader("Choose audio file", type=["wav","mp3","m4a","flac","ogg"])
+                    if file:
+                        name = f"saved_audio/uploaded_{datetime.now():%Y%m%d_%H%M%S}_{file.name}"
+                        open(name, "wb").write(file.read())
+                        save_path = name
+                        st.audio(save_path)
+                        st.success("✅ File uploaded successfully")
 
-        with st.spinner("Estimating respiration rate..."):
-            try:
-                rpm, num_breaths = calculate_rpm(save_path)
-                st.metric(label="🫁 Estimated Respirations Per Minute", value=f"{rpm:.1f}")
-                st.caption(f"Detected {num_breaths} breaths in this recording.")
-            except Exception as e:
-                st.error(f"Could not estimate RPM: {e}")
+            # 🎙️ Record Second
+            with col2:
+                if choice == "🎙️ Record Audio":
+                    st.info("Click to start and stop recording.")
+                    audio_bytes = audio_recorder(sample_rate=16000)
+                    if audio_bytes:
+                        name = f"saved_audio/recording_{datetime.now():%Y%m%d_%H%M%S}.wav"
+                        open(name, "wb").write(audio_bytes)
+                        save_path = name
+                        st.audio(save_path)
+                        st.success("✅ Recording saved")
 
-        if cough_detected:
-            st.success("💨 Cough detected! You can now proceed to video analysis.")
-        else:
-            st.info("🫁 No strong cough detected. You can still analyze your posture.")
+            # Analysis
+            if save_path:
+                with st.spinner("🔍 Analyzing audio..."):
+                    try:
+                        cough_prob = predict_cough_from_file(save_path, yamnet_model, class_names)
+                        rpm, breaths = calculate_rpm(save_path)
+                        colA, colB = st.columns(2)
+                        with colA: st.metric("💨 Cough Probability", f"{cough_prob:.2f}")
+                        with colB: st.metric("🫁 Respirations / min", f"{rpm:.1f}")
+                        st.caption(f"Detected {breaths} breaths in this clip.")
+                        st.success("💨 Cough detected!" if cough_prob>0.3 else "🫁 No strong cough detected.")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+            st.markdown("</div>", unsafe_allow_html=True)
 
-    # --------------------
-    # 2️⃣ Tripod Detection
-    # --------------------
-    st.header("Step 2: Tripod Detection from Video")
-    video_source = st.radio("Choose video input method:", ["📁 Upload Video", "🎥 Record with Webcam"])
-    video_path = None
+    # --- VIDEO TAB ---
+    with tab_video:
+        with st.container():
+            st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+            st.subheader("Step 2 · Tripod Detection")
+            st.caption("Upload or record a short video to detect the 'tripod' sitting posture.")
+            choice = st.radio("Video Input:", ["📁 Upload Video", "🎥 Record Webcam"])
+            video_path = None
 
-    if video_source == "📁 Upload Video":
-        video_file = st.file_uploader("Upload a video (mp4/mov/avi/mkv)", type=["mp4", "mov", "avi", "mkv"])
-        if video_file:
-            vtemp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(video_file.name)[1])
-            vtemp.write(video_file.read())
-            vtemp.close()
-            video_path = vtemp.name
+            if choice == "📁 Upload Video":
+                file = st.file_uploader("Upload video", type=["mp4","mov","avi","mkv"])
+                if file:
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.name)[1])
+                    tmp.write(file.read()); tmp.close()
+                    video_path = tmp.name
 
+            elif choice == "🎥 Record Webcam":
+                st.info("Start webcam, then stop and click 'Save Recording'.")
+                ctx = webrtc_streamer(key="rec", video_transformer_factory=VideoRecorder)
+                if ctx.video_transformer and st.button("Save Recording"):
+                    frames = ctx.video_transformer.frames
+                    if frames:
+                        out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+                        h, w, _ = frames[0].shape
+                        writer = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*"mp4v"), 20, (w,h))
+                        for f in frames: writer.write(f)
+                        writer.release()
+                        video_path = out
+                        st.success("🎬 Recording saved")
+                    else:
+                        st.warning("No frames recorded. Try again.")
 
-    elif video_source == "🎥 Record with Webcam":
-        st.info("Click 'Start' to record your webcam. Press 'Stop' and then 'Save Recording'.")
-        webrtc_ctx = webrtc_streamer(key="tripod-recorder", video_transformer_factory=VideoRecorder)
-        if webrtc_ctx.video_transformer:
-            if st.button("Save Recording"):
-                frames = webrtc_ctx.video_transformer.frames
-                if frames:
-                    out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-                    h, w, _ = frames[0].shape
-                    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), 20, (w, h))
-                    for frame in frames:
-                        writer.write(frame)
-                    writer.release()
-                    video_path = out_path
-                    st.success("🎬 Recording saved successfully!")
-                else:
-                    st.warning("No frames recorded. Try again.")
+            if video_path:
+                with st.spinner("🔍 Analyzing posture..."):
+                    try:
+                        out, ratio = process_video_tripod(video_path, tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name)
+                        st.video(out)
+                        st.metric("🧍 Tripod Detected Frames", f"{ratio*100:.1f}%")
+                        st.success("Tripod posture detected!" if ratio>0.2 else "Tripod posture rarely detected.")
+                    except Exception as e:
+                        st.error(f"Error processing video: {e}")
+            st.markdown("</div>", unsafe_allow_html=True)
 
-    if video_path:
-        out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-        with st.spinner("Analyzing video for tripod position..."):
-            try:
-                out_path, tripod_ratio = process_video_tripod(video_path, out_path)
-                st.success(f"🧍 Tripod detected in **{tripod_ratio*100:.1f}%** of frames.")
-                st.video(out_path)
-            except Exception as e:
-                st.error(f"Error processing video: {e}")
+    st.markdown("<p class='footer'>© 2025 Cough + Tripod Detector | Built with Streamlit</p>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
